@@ -1,8 +1,17 @@
+#r "nuget: System.Text.Encoding.CodePages"
+
 open System
 open System.Net
 open System.Text
 open System.IO
 open System.Text.RegularExpressions
+open System.Net.Http
+
+// Register encoding provider to support Windows-1251
+Encoding.RegisterProvider(CodePagesEncodingProvider.Instance)
+
+// Create a single HttpClient instance to be reused
+let httpClient = new HttpClient()
 
 //just a short snippet to measure time spent in an eagerly executed function
 //not gonna work with lazy function, e.g. function returning a sequence (IEnumerable)
@@ -35,13 +44,14 @@ let rec orderedListsMerge xs ys keyExtractor merger =
             orderedListsMerge xs' ys keyExtractor merger
 
 let webRequestHtml (url : string) =
-    let req = WebRequest.Create(url)
-    let resp = req.GetResponse()
-    let stream = resp.GetResponseStream()
-    let reader = new StreamReader(stream, Encoding.GetEncoding("Windows-1251"))     //don't forget the Encoding, when you work with international documents
-    let html = reader.ReadToEnd()
-    resp.Close()
-    html
+    // Use async computation expression
+    let asyncResult = async {
+        let! response = httpClient.GetAsync(url) |> Async.AwaitTask
+        let! content = response.Content.ReadAsByteArrayAsync() |> Async.AwaitTask
+        return Encoding.GetEncoding("Windows-1251").GetString(content)
+    }
+    // Execute async code synchronously (since the rest of the code is sync)
+    Async.RunSynchronously asyncResult
 
 let regexSingleLineMatch input pattern =
     Regex.Match(input, pattern, RegexOptions.Singleline).Groups.Item(1).Value
@@ -49,21 +59,25 @@ let regexSingleLineMatch input pattern =
 let regexMatches input pattern =
     seq { for m in Regex.Matches(input, pattern) -> m.Groups.Item(1).Value }
 
+let regexSingleLineMatches input pattern =
+    seq { for m in Regex.Matches(input, pattern, RegexOptions.Singleline) -> m.Groups.Item(1).Value }
+
 //only named hrefs point to poems
 let extractNamedHrefs html = 
     //I tried XmlDocument here, but it doesn't work as HTML can contain some "invalid" elements like &nbsp;
     //Stand back now, I'm going to use regular expressions!
-    let hrefPattern = "<a name=.* href=\"(.+?)\">.*</a>"
+    let hrefPattern = "<a name=.* href=\"(.+?)\">.+?</a>"
     regexMatches html hrefPattern
 
 
 //remove all html markup from the line
 let cleanupHtml text =
-    let htmlTagPattern = "<.+?>"
-    Regex.Replace(text, htmlTagPattern, String.Empty)
+    let htmlTagPattern = new Regex("<[^>]*>", RegexOptions.Compiled)
+    let withoutTags = htmlTagPattern.Replace(text, String.Empty)
+    let newlinePattern = new Regex("[\r\n]+", RegexOptions.Compiled)
+    newlinePattern.Replace(withoutTags, " ")
 
     
-//remove all html markup from the line
 let takeFirstLine text =
     let firstLinePattern = "(.*)"
     Regex.Match(text, firstLinePattern).Groups.Item(1).Value
@@ -75,7 +89,7 @@ type Poem(poemHref : string, title : string, lines : seq<string>) =
     member this.Title =
         let newTitle = 
             match title with
-            | "* * *" -> (lines |> Seq.nth 0)
+            | "* * *" -> (lines |> Seq.item 0)
             | _ -> title
         if(newTitle.Length > MAX_TITLE_LENGTH) then
             newTitle.Substring(0, MAX_TITLE_LENGTH-3) + "..."
@@ -99,11 +113,11 @@ type Poem(poemHref : string, title : string, lines : seq<string>) =
 let producePoem poemHref poemHtml =
     //titles can be multiline, sometimes they include sub-titles
     let titlePattern = "<h1>(.+?)</h1>" 
-    let linePattern = "<span class=\"line.*>(.+?)</span>"
+    let linePattern = "<span class=\"line[^>]*>(.+?)</span>"
     new Poem(
         poemHref,
         (regexSingleLineMatch poemHtml titlePattern) |> cleanupHtml |> takeFirstLine, 
-        regexMatches poemHtml linePattern |> Seq.map cleanupHtml)
+        regexSingleLineMatches poemHtml linePattern |> Seq.map cleanupHtml)
 
 
 //check that the given link is a link to a final edition poem, not early edition to avoid duplicate texts in index
@@ -263,7 +277,7 @@ let getPoemResult index findToken findPosition =
                     |> List.filter (fun (lineNumber, position) -> position = findPosition)
                     |> List.map (fun (lineNumber, position) -> (poemNumber, lineNumber))
         )
-        |> Seq.nth 0
+        |> Seq.item 0
 
 
 type QueryResult =
@@ -301,10 +315,10 @@ let prettifyQueryResults queryResults poems =
                 | SinglePoem (poemNumber, lineNumber) -> 
                     let (poem : Poem) = 
                         poems
-                            |> Seq.nth poemNumber
+                            |> Seq.item poemNumber
                     let line =
                         poem.Lines
-                            |> Seq.nth lineNumber
+                            |> Seq.item lineNumber
                     PrettySinglePoem(poem.Title, poem.Href, lineNumber, line)
                 | LineVariant (token, count) -> PrettyLineVariant(token,count)
         )
@@ -329,73 +343,57 @@ let createPushkinTree pushkinPoems poemsIndex count =
     createTreeLevel count [] poemsIndex
 
 let resultsToHtml pushkinTree =
-    let rec treeToHtml tree currentPath (currentNumber:int) startingNumber =
-        let zippedTreeLevel =
-            tree
-                |> Seq.zip (Seq.initInfinite (fun i -> startingNumber+i))
+    let rec treeToHtml tree =
+        let zippedTreeLevel = tree |> Seq.zip (Seq.initInfinite id)
+        
+        zippedTreeLevel
+            |> Seq.fold
+            (
+                fun acc treeNode ->
+                    match treeNode with
+                    | (number, PoemNode (title, href, lineNumber, line)) ->
+                        acc + sprintf "<div class='poem'><span class='line'>%s</span> <span class='line-source'>(<a target='blank' class='fromlink' href='%s'>%s</a>, строка %d)</span></div>\n" 
+                            line href title (lineNumber+1)
+                    | (number, VariantNode (token, freq, subtree)) ->
+                        // Now each node is wrapped in its own container div that controls visibility
+                        acc + sprintf "<div class='variant-container'><div class='variant'><span class='term' onclick='this.closest(\".variant-container\").classList.toggle(\"open\")'>%s &#8658; %d</span></div><div class='children'>%s</div></div>\n" 
+                            token freq (treeToHtml subtree)
+            ) ""
+    
+    treeToHtml pushkinTree
 
-        let pathToString path =
-            let parts = 
-                path
-                    |> Seq.map (fun x -> "'"+x+"'")
-            String.Join(",", parts)
+let outputCompleteHtml tree =
+    let htmlPrelude = """<!DOCTYPE html>
+<html>
+<head>
+    <title>Pushkin Tree</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .variant-container .children { display: none; margin-left: 20px; }
+        .variant-container.open > .children { display: block; }
+        .term { color: blue; cursor: pointer; }
+        .term:hover { text-decoration: underline; }
+        .line-source { font-style: italic; font-size: 0.5em; }
+        .fromlink { text-decoration: none; }
+        .fromlink:hover { text-decoration: underline; }
+        .children { border-left: 1px solid #ddd; padding-left: 10px; }
+    </style>
+</head>
+<body>"""
 
-        let thisLevelStart = String.Format("<div class=\"x\"><table id=\"{0}\" class=\"p\">", currentNumber) + Environment.NewLine
-        let thisLevelTable = 
-            zippedTreeLevel
-                |> Seq.fold
-                (
-                    fun acc treeNode ->
-                        match treeNode with
-                        | (number, PoemNode (title, href, lineNumber, line)) ->
-                            acc + String.Format("<tr><td><span class=line>{0}</span> &#8658; <a target=blank class=fromlink href=\"{1}\">{2}</a>, строка {3}</tr>",line, href, title, lineNumber+1) + Environment.NewLine
-                        | (number, VariantNode (token, freq, subtree)) ->
-                            acc + String.Format("<tr id=\"r{0}\"><td>{1} &#8658; <span class=\"lv\" onClick=\"x([{2}])\">{3}</span></td></tr>", number, token, (pathToString (currentPath@[string(number)])), freq) + Environment.NewLine
-                ) ""
-        let thisLevelEnd = @"</table></div>" + Environment.NewLine + Environment.NewLine
-
-        let thisLevelOutput = (thisLevelStart+thisLevelTable+thisLevelEnd)
-
-        let levelLength = 
-            tree
-                |> Seq.length
-
-        let (subTreeCount, subTreeOutput) =
-            zippedTreeLevel 
-                |> Seq.fold
-                (
-                    fun (acc, result) treeNode ->
-                        match treeNode with
-                        | (number, PoemNode (title, href, lineNumber, line)) ->
-                            (acc, result)
-                        | (number, VariantNode (token, freq, subtree)) ->
-                            let (subTreeCount, subTreeOutput) = treeToHtml subtree (currentPath@[string(number)]) number (startingNumber+acc+levelLength)
-                            (acc + subTreeCount, result + subTreeOutput)
-                ) (0, "")
-
-        (levelLength + subTreeCount, thisLevelOutput + subTreeOutput)
-       
-    let (_, content) = treeToHtml pushkinTree ["0"] 0 1
-    content
-
-let outputResultsToFile (content:string) =
-    let templateFile = "template.htm"
-    let outputFile = "output.htm"
-    let templateReplacePattern = "#HERE_GOES_CONTENT#"
-    let templateHtml = File.ReadAllText(templateFile)
-    let resultHtml = Regex.Replace(templateHtml, templateReplacePattern, content)
-    File.WriteAllText(outputFile, resultHtml)
-
+    let htmlEnd = """</body>
+</html>"""
+    
+    let content = resultsToHtml tree
+    File.WriteAllText("output.html", htmlPrelude + content + htmlEnd)
 
 let poems = crawlPoems //lazy operation, so we can't time it here, we do it the in next line
 printfn "Crawled %d poems" (time "Crawling poems" (fun() -> poems |> Seq.length))
 printfn "Crawled %d lines" (poems |> Seq.sumBy ( fun poem -> poem.Lines |> Seq.length))
 let poemIndex = time "Indexing poems" (fun () -> poems |> indexPoems)
 printfn "Index contains %d terms" poemIndex.Length
-let tree = time "Generating result tree" (fun () -> createPushkinTree poems poemIndex 20) 
-let htmlContent = time "Generating html content" (fun () -> resultsToHtml tree)
-time "Output content" (fun() -> outputResultsToFile htmlContent)
+let tree = time "Generating result tree" (fun () -> createPushkinTree poems poemIndex 20)
+time "Output content" (fun() -> outputCompleteHtml tree)
 
-//let queryResult = queryIndex poemIndex ["но"] 10
-//let prettyResult = prettifyQueryResults queryResult poems
+
 

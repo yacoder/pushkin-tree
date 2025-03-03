@@ -3,7 +3,7 @@ pushkin-tree
 
 F# implementation of a robot indexing poems of Alexander Pushkin
 
-https://yacoder.github.io/pushkin-tree.htm
+https://yacoder.github.io/pushkin-tree.html
 
 Inspired by Shakespeare Search: https://web.archive.org/web/20160929083259/http://www.rhymezone.com/shakespeare
 

@@ -1,4 +1,4 @@
-#r "nuget: System.Text.Encoding.CodePages"
+module Pushkin
 
 open System
 open System.Net
@@ -387,13 +387,24 @@ let outputCompleteHtml tree =
     let content = resultsToHtml tree
     File.WriteAllText("output.html", htmlPrelude + content + htmlEnd)
 
-let poems = crawlPoems //lazy operation, so we can't time it here, we do it the in next line
-printfn "Crawled %d poems" (time "Crawling poems" (fun() -> poems |> Seq.length))
-printfn "Crawled %d lines" (poems |> Seq.sumBy ( fun poem -> poem.Lines |> Seq.length))
-let poemIndex = time "Indexing poems" (fun () -> poems |> indexPoems)
-printfn "Index contains %d terms" poemIndex.Length
-let tree = time "Generating result tree" (fun () -> createPushkinTree poems poemIndex 20)
-time "Output content" (fun() -> outputCompleteHtml tree)
+[<EntryPoint>]
+let main args =
+    let poems = crawlPoems //lazy operation, so we can't time it here, we do it the in next line
+    printfn "Crawled %d poems" (time "Crawling poems" (fun() -> poems |> Seq.length))
+    printfn "Crawled %d lines" (poems |> Seq.sumBy ( fun poem -> poem.Lines |> Seq.length))
+    let poemIndex = time "Indexing poems" (fun () -> poems |> indexPoems)
+    printfn "Index contains %d terms" poemIndex.Length
+    let tree = time "Generating result tree" (fun () -> createPushkinTree poems poemIndex 20)
+    time "Output content" (fun() -> outputCompleteHtml tree)
+    0
 
 
-
+// 2025-03-02
+// dotnet run -c Release
+// Crawling poems took 148633 ms
+// Crawled 834 poems
+// Crawled 33929 lines
+// Indexing poems took 25280 ms
+// Index contains 31346 terms
+// Generating result tree took 436090 ms
+// Output content took 31 ms
